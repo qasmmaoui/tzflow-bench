@@ -205,6 +205,10 @@ static void elem_hash(const rule_t *x, uint16_t out[LANES]) {
 }
 static void dig_add(uint16_t d[LANES], const rule_t *x) { uint16_t h[LANES]; elem_hash(x, h); for (int i = 0; i < LANES; i++) d[i] += h[i]; }
 static void dig_sub(uint16_t d[LANES], const rule_t *x) { uint16_t h[LANES]; elem_hash(x, h); for (int i = 0; i < LANES; i++) d[i] -= h[i]; }
+static int table_digest_ok(const rule_t *r, int n, const uint16_t ref[LANES]) {
+    uint16_t d[LANES] = {0}; for (int i = 0; i < n; i++) dig_add(d, &r[i]);
+    return memcmp(d, ref, sizeof d) == 0;
+}
 
 /* ---------------- stats ---------------- */
 static int cmpd(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
@@ -226,7 +230,7 @@ int main(int argc, char **argv) {
     FILE *fd = fopen("results/d1_digest.csv", "w");
     if (!f3 || !f4 || !f5 || !fd) { perror("results/"); return 1; }
     fprintf(f3, "rules,cache_entries,tuples,median_ms,p5_ms,p95_ms,us_per_entry,false_positives\n");
-    fprintf(f4, "rules,cache_entries,attack,injected,harmful,detected_harmful,flagged_harmless\n");
+    fprintf(f4, "rules,cache_entries,attack,injected,harmful,detected_harmful,flagged_harmless,tableonly_detected_harmful\n");
     fprintf(f5, "rules,cache_entries,tampered,sample_size,trials,detect_prob\n");
     fprintf(fd, "rules,op,median_us,p5_us,p95_us\n");
 
@@ -248,6 +252,7 @@ int main(int argc, char **argv) {
             rule_t saved = r[n / 2]; r[n / 2].act ^= 1; for (int i = 0; i < n; i++) dig_add(d2, &r[i]); r[n / 2] = saved;
             fprintf(fd, "%d,tamper_detected,%d,,\n", n, memcmp(d1, d2, sizeof d1) != 0);
         }
+        uint16_t dref[LANES] = {0}; for (int i = 0; i < n; i++) dig_add(dref, &r[i]);
 
         for (int ci = 0; ci < 4; ci++) {
             int target = CS[ci];
@@ -260,16 +265,22 @@ int main(int argc, char **argv) {
             for (int k = 0; k < reps; k++) { double a = now_s(); fp = sweep(r, n, c.e, ne); t[k] = (now_s() - a) * 1e3; }
             { double m, a, b; stats(t, reps, &m, &a, &b); fprintf(f3, "%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%ld\n", n, ne, c.nt, m, a, b, m * 1e3 / ne, fp); fflush(f3); }
 
+            /* Baseline "table only" (protection of the OpenFlow table, as in
+               enclave-based prior work): it raises an alarm iff the digest of the
+               live rule table differs from the reference digest. Cache attacks
+               below leave the table untouched; we still recompute and compare
+               the digest after each attack so the baseline result is measured. */
             /* E4a: redirection */
-            int inj = ne < 1000 ? ne / 10 : 100, det = 0;
+            int inj = ne < 1000 ? ne / 10 : 100, det = 0, bdet = 0;
             for (int k = 0; k < inj; k++) {
                 int i = rndu(ne); mflow_t e = c.e[i];
                 uint32_t na; do na = rndu(nports + 1); while (na == e.act); e.act = na;
                 det += !check_entry(r, n, &e);
+                bdet += !table_digest_ok(r, n, dref);
             }
-            fprintf(f4, "%d,%d,redirect,%d,%d,%d,0\n", n, ne, inj, inj, det);
+            fprintf(f4, "%d,%d,redirect,%d,%d,%d,0,%d\n", n, ne, inj, inj, det, bdet);
             /* E4b: widening (clear 1..8 random set bits of the mask) */
-            int harm = 0, dh = 0, fh = 0;
+            int harm = 0, dh = 0, fh = 0, bdh = 0;
             for (int k = 0; k < inj; k++) {
                 int i = rndu(ne); mflow_t e = c.e[i];
                 int clears = 1 + rndu(8);
@@ -280,8 +291,28 @@ int main(int argc, char **argv) {
                 }
                 int h = widening_harmful(r, n, &e, 256), flagged = !check_entry(r, n, &e);
                 harm += h; dh += h && flagged; fh += !h && flagged;
+                bdh += h && !table_digest_ok(r, n, dref);
             }
-            fprintf(f4, "%d,%d,widen,%d,%d,%d,%d\n", n, ne, inj, harm, dh, fh); fflush(f4);
+            fprintf(f4, "%d,%d,widen,%d,%d,%d,%d,%d\n", n, ne, inj, harm, dh, fh, bdh);
+            /* E4c: rule-table tampering (action of one non-default rule rewritten).
+               Uses a separate RNG so that the other experiments are unchanged. */
+            {
+                uint64_t lcg = 0x5DEECE66DULL ^ (uint64_t)(n * 131 + ne);
+                int tinj = inj, tdet = 0, tbdet = 0;
+                for (int k = 0; k < tinj; k++) {
+                    lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
+                    int i = (int)((lcg >> 33) % (uint64_t)(n - 1));
+                    rule_t saved = r[i];
+                    r[i].act = (r[i].act + 1 + (uint32_t)((lcg >> 17) % nports)) % (nports + 1);
+                    if (r[i].act == saved.act) r[i].act = (saved.act + 1) % (nports + 1);
+                    int alarm = !table_digest_ok(r, n, dref);
+                    tdet += alarm;      /* TZ-Flow: Reference Table digest vs controller digest */
+                    tbdet += alarm;     /* table-only baseline uses the same digest check */
+                    r[i] = saved;
+                }
+                fprintf(f4, "%d,%d,table_tamper,%d,%d,%d,0,%d\n", n, ne, tinj, tinj, tdet, tbdet);
+            }
+            fflush(f4);
 
             /* E5: sampling, k tampered among ne, sample size s (empirical) */
             const int KS[] = {1, 5, 20}; const double SF[] = {0.01, 0.05, 0.10, 0.25};
