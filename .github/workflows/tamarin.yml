@@ -1,0 +1,35 @@
+name: tamarin-proofs
+
+on:
+  push:
+    branches: [main]
+    paths: ["models/**", ".github/workflows/tamarin.yml"]
+  workflow_dispatch:
+
+jobs:
+  prove:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Tamarin (Homebrew)
+        run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew install tamarin-prover/tap/tamarin-prover
+          echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+
+      - name: Prove all lemmas
+        run: |
+          mkdir -p results
+          tamarin-prover --version | head -3 | tee results/tamarin-version.txt
+          tamarin-prover --prove models/tzflow.spthy 2>&1 | tee results/tamarin.txt
+          echo "---- summary ----"
+          sed -n '/summary of summaries/,$p' results/tamarin.txt
+          if grep -qE "falsified|analysis incomplete" results/tamarin.txt; then echo "Some lemma is falsified or incomplete"; exit 1; fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tamarin-results
+          path: results/

@@ -1,0 +1,137 @@
+/*
+ * TZ-Flow: symbolic model of the Rule Gate and the attestation protocol.
+ *
+ * Roles
+ *   C   controller enclave (SGX), trusted
+ *   TA  TZ-Flow trusted application in the switch secure world, trusted
+ *   Adversary: Dolev-Yao network + full control of the switch normal world,
+ *              modelled by the Tamper rule (it can set the live datapath state
+ *              to any value it knows) and by message injection.
+ *
+ * Abstractions
+ *   - A flow table / datapath state is abstracted by a digest value.
+ *   - The channel key k results from the attested cross-TEE bootstrap; it is
+ *     modelled as a pre-shared secret that only C and TA hold, unless revealed.
+ *   - The keyed tag on a FLOW_MOD is modelled as h(<k, rule>).
+ *   - The TA reads the live datapath truthfully (it maps physical memory);
+ *     this is the trust assumption on the secure world.
+ */
+theory TZFlow
+begin
+
+builtins: signing, hashing
+
+/* ---------- Provisioning ---------- */
+
+rule Provision_Device:
+    [ Fr(~ltk) ]
+  --[ Provisioned($S) ]->
+    [ !Ltk($S, ~ltk), !Pk($S, pk(~ltk)), Out(pk(~ltk)) ]
+
+rule Bootstrap_Channel:
+    [ Fr(~k) ]
+  --[ ChannelUp($C, $S) ]->
+    [ !Shared($C, $S, ~k) ]
+
+/* ---------- Rule Gate (contribution: authenticated rule installation) ---------- */
+
+rule C_Issue_Rule:
+    [ !Shared(C, S, k), Fr(~r) ]
+  --[ Issued(C, S, ~r) ]->
+    [ Out(<~r, h(<k, ~r>)>) ]
+
+rule TA_Gate_Accept:
+    [ !Shared(C, S, k), In(<r, h(<k, r>)>) ]
+  --[ GateAccept(C, S, r) ]->
+    [ ]
+
+/* ---------- Reference state and live datapath ---------- */
+
+rule Install_Reference:
+    [ Fr(~h) ]
+  --[ Installed($C, $S, ~h) ]->
+    [ CRef($C, $S, ~h), TRef($S, ~h), Live($S, ~h) ]
+
+/* Normal-world adversary rewrites the datapath to any value it knows. */
+rule Tamper:
+    [ Live(S, h), In(x) ]
+  --[ Tampered(S, x) ]->
+    [ Live(S, x) ]
+
+/* ---------- Attestation ---------- */
+
+rule C_Request:
+    [ CRef(C, S, h), Fr(~n) ]
+  --[ Request(C, S, ~n) ]->
+    [ Pending(C, S, ~n, h), Out(<'att_req', ~n>) ]
+
+rule TA_Attest:
+    [ In(<'att_req', n>), TRef(S, href), Live(S, hlive), !Ltk(S, ltk) ]
+  --[ Measured(S, n, href, hlive) ]->
+    [ TRef(S, href), Live(S, hlive),
+      Out(<<n, href, hlive>, sign(<n, href, hlive>, ltk)>) ]
+
+rule C_Accept:
+    [ Pending(C, S, n, h), !Pk(S, pkS), In(<<n, h, h>, sig>) ]
+  --[ Eq(verify(sig, <n, h, h>, pkS), true), Accept(C, S, n, h) ]->
+    [ CRef(C, S, h) ]
+
+rule C_Alarm:
+    [ Pending(C, S, n, h), !Pk(S, pkS), In(<<n, h, x>, sig>) ]
+  --[ Eq(verify(sig, <n, h, x>, pkS), true), Neq(x, h), Alarm(C, S, n) ]->
+    [ CRef(C, S, h) ]
+
+/* ---------- Compromise ---------- */
+
+rule Reveal_Device_Key:
+    [ !Ltk(S, ltk) ] --[ RevealLtk(S) ]-> [ Out(ltk) ]
+
+rule Reveal_Channel_Key:
+    [ !Shared(C, S, k) ] --[ RevealK(C, S) ]-> [ Out(k) ]
+
+restriction Equality:
+  "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+restriction Inequality:
+  "All x #i. Neq(x, x) @ #i ==> F"
+
+/* ---------- Sanity: the honest runs are possible ---------- */
+
+lemma exec_accept: exists-trace
+  "Ex C S n h #i. Accept(C, S, n, h) @ #i & not (Ex #r. RevealLtk(S) @ #r)"
+
+lemma exec_alarm: exists-trace
+  "Ex C S n #i. Alarm(C, S, n) @ #i & not (Ex #r. RevealLtk(S) @ #r)"
+
+lemma exec_gate: exists-trace
+  "Ex C S r #i. GateAccept(C, S, r) @ #i & not (Ex #k. RevealK(C, S) @ #k)"
+
+/* ---------- Security properties ---------- */
+
+/* G4/A5: the Rule Gate only accepts rules the controller issued. */
+lemma gate_authenticity:
+  "All C S r #i. GateAccept(C, S, r) @ #i ==>
+     (Ex #j. Issued(C, S, r) @ #j & #j < #i) | (Ex #k. RevealK(C, S) @ #k)"
+
+/* G1+G3: an accepted report means the secure world measured, for this very
+   nonce, a live datapath equal to the controller's reference. */
+lemma accept_implies_consistent_measurement:
+  "All C S n h #i. Accept(C, S, n, h) @ #i ==>
+     (Ex #j. Measured(S, n, h, h) @ #j & #j < #i) | (Ex #r. RevealLtk(S) @ #r)"
+
+/* G2: no replay - a report is accepted at most once per nonce. */
+lemma no_replay:
+  "All C S n h #i #j. Accept(C, S, n, h) @ #i & Accept(C, S, n, h) @ #j ==> #i = #j"
+
+/* Limitation (expected to be VERIFIED as an attack trace): attestation is a
+   point-in-time measurement. A normal-world attacker can tamper with the
+   datapath, then restore it before the next measurement, and the controller
+   still accepts. TZ-Flow bounds this window with periodic requests, counters
+   cross-checks and, in Lock mode, by preventing the write altogether. */
+lemma transient_tampering_between_measurements: exists-trace
+  "Ex C S n h x #t #u #a.
+     Tampered(S, x) @ #t & Tampered(S, h) @ #u & #t < #u & #u < #a &
+     Accept(C, S, n, h) @ #a & not (x = h) &
+     not (Ex #r. RevealLtk(S) @ #r)"
+
+end
