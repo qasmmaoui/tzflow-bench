@@ -25,7 +25,7 @@ jobs:
         run: |
           mkdir -p results
           tamarin-prover --version | head -3 | tee results/tamarin-version.txt
-          tamarin-prover --prove models/tzflow.spthy 2>&1 | tee results/tamarin.txt
+          timeout 1800 tamarin-prover --prove models/tzflow.spthy 2>&1 | tee results/tamarin.txt
           echo "---- summary ----"
           sed -n '/summary of summaries/,$p' results/tamarin.txt
           if grep -qE "falsified|analysis incomplete" results/tamarin.txt; then echo "Some lemma is falsified or incomplete"; exit 1; fi

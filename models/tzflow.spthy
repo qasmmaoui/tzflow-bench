@@ -47,39 +47,41 @@ rule TA_Gate_Accept:
 
 /* ---------- Reference state and live datapath ---------- */
 
+/* The authorized state is installed once per (C, S) epoch and kept by both TEEs. */
 rule Install_Reference:
     [ Fr(~h) ]
   --[ Installed($C, $S, ~h) ]->
-    [ CRef($C, $S, ~h), TRef($S, ~h), Live($S, ~h) ]
-
-/* Normal-world adversary rewrites the datapath to any value it knows. */
-rule Tamper:
-    [ Live(S, h), In(x) ]
-  --[ Tampered(S, x) ]->
-    [ Live(S, x) ]
+    [ !CRef($C, $S, ~h), !TRef($S, ~h) ]
 
 /* ---------- Attestation ---------- */
 
 rule C_Request:
-    [ CRef(C, S, h), Fr(~n) ]
+    [ !CRef(C, S, h), Fr(~n) ]
   --[ Request(C, S, ~n) ]->
     [ Pending(C, S, ~n, h), Out(<'att_req', ~n>) ]
 
-rule TA_Attest:
-    [ In(<'att_req', n>), TRef(S, href), Live(S, hlive), !Ltk(S, ltk) ]
-  --[ Measured(S, n, href, hlive) ]->
-    [ TRef(S, href), Live(S, hlive),
-      Out(<<n, href, hlive>, sign(<n, href, hlive>, ltk)>) ]
+/* The TA measures the live datapath. Either the normal world left it intact
+   (live = reference), or the normal-world adversary set it to any value x it
+   knows (Tampered). The TA reads it truthfully in both cases. */
+rule TA_Attest_Intact:
+    [ In(<'att_req', n>), !TRef(S, href), !Ltk(S, ltk) ]
+  --[ Measured(S, n, href, href) ]->
+    [ Out(<<n, href, href>, sign(<n, href, href>, ltk)>) ]
+
+rule TA_Attest_Tampered:
+    [ In(<'att_req', n>), !TRef(S, href), !Ltk(S, ltk), In(x) ]
+  --[ Tampered(S, x), Measured(S, n, href, x) ]->
+    [ Out(<<n, href, x>, sign(<n, href, x>, ltk)>) ]
 
 rule C_Accept:
     [ Pending(C, S, n, h), !Pk(S, pkS), In(<<n, h, h>, sig>) ]
   --[ Eq(verify(sig, <n, h, h>, pkS), true), Accept(C, S, n, h) ]->
-    [ CRef(C, S, h) ]
+    [ ]
 
 rule C_Alarm:
     [ Pending(C, S, n, h), !Pk(S, pkS), In(<<n, h, x>, sig>) ]
   --[ Eq(verify(sig, <n, h, x>, pkS), true), Neq(x, h), Alarm(C, S, n) ]->
-    [ CRef(C, S, h) ]
+    [ ]
 
 /* ---------- Compromise ---------- */
 
@@ -123,15 +125,15 @@ lemma accept_implies_consistent_measurement:
 lemma no_replay:
   "All C S n h #i #j. Accept(C, S, n, h) @ #i & Accept(C, S, n, h) @ #j ==> #i = #j"
 
-/* Limitation (expected to be VERIFIED as an attack trace): attestation is a
-   point-in-time measurement. A normal-world attacker can tamper with the
-   datapath, then restore it before the next measurement, and the controller
-   still accepts. TZ-Flow bounds this window with periodic requests, counters
-   cross-checks and, in Lock mode, by preventing the write altogether. */
+/* Limitation (expected to be VERIFIED as a trace): attestation is a
+   point-in-time measurement. A datapath that was tampered with at one
+   measurement can be restored, and a later request is then accepted.
+   TZ-Flow bounds this window with periodic requests, counter cross-checks
+   and, in Lock mode, by preventing the write altogether. */
 lemma transient_tampering_between_measurements: exists-trace
-  "Ex C S n h x #t #u #a.
-     Tampered(S, x) @ #t & Tampered(S, h) @ #u & #t < #u & #u < #a &
-     Accept(C, S, n, h) @ #a & not (x = h) &
+  "Ex C S n1 n2 h x #t #a.
+     Measured(S, n1, h, x) @ #t & not (x = h) & #t < #a &
+     Accept(C, S, n2, h) @ #a &
      not (Ex #r. RevealLtk(S) @ #r)"
 
 end
