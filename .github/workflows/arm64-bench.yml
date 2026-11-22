@@ -1,0 +1,40 @@
+name: arm64-bench
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      reps:
+        description: "Repetitions per measurement"
+        default: "30"
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev
+
+      - name: Record platform
+        run: |
+          mkdir -p results
+          { echo "## uname"; uname -a; echo; echo "## lscpu"; lscpu; echo; echo "## gcc"; gcc --version | head -1; echo; echo "## openssl"; openssl version; } > results/platform.txt
+          cat results/platform.txt
+
+      - name: Build
+        run: gcc -O2 -march=native -Wall -o tzbench src/tzbench.c -lcrypto
+
+      - name: Run benchmark
+        run: |
+          REPS="${{ github.event.inputs.reps }}"
+          ./tzbench "${REPS:-30}"
+          for f in results/*.csv; do echo "### $f"; cat "$f"; echo; done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tzbench-results-arm64
+          path: results/
