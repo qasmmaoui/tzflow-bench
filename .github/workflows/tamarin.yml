@@ -16,6 +16,8 @@ jobs:
       - name: Install Tamarin (Homebrew)
         run: |
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew tap tamarin-prover/tap
+          brew trust tamarin-prover/tap
           brew install tamarin-prover/tap/tamarin-prover
           echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
 
